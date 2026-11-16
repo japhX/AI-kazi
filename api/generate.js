@@ -1,129 +1,67 @@
-// Simple helper to turn Gemini's Markdown into clean HTML for email inboxes
-function markdownToEmailHtml(md) {
-  return md
-    .split('\n')
-    .map((line) => {
-      const trimmed = line.trim();
-      if (!trimmed) return '<br/>';
-      if (trimmed === '---') return '<hr style="border:none;border-top:1px solid #e5e7eb;margin:20px 0;"/>';
-      if (trimmed.startsWith('## ')) {
-        return `<h2 style="color:#4f46e5;font-size:20px;margin:24px 0 10px;">${trimmed.slice(3)}</h2>`;
-      }
-      if (trimmed.startsWith('### ')) {
-        return `<h3 style="color:#111827;font-size:16px;margin:18px 0 8px;">${trimmed.slice(4)}</h3>`;
-      }
-      if (trimmed.startsWith('> ')) {
-        return `<blockquote style="border-left:4px solid #4f46e5;background:#eef2ff;padding:12px 16px;margin:14px 0;color:#312e81;border-radius:0 8px 8px 0;">${trimmed.slice(2)}</blockquote>`;
-      }
-      if (trimmed.startsWith('* ') || trimmed.startsWith('- ')) {
-        const content = trimmed.slice(2).replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
-        return `<li style="margin:6px 0;color:#374151;line-height:1.6;">${content}</li>`;
-      }
-      const formatted = trimmed.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
-      return `<p style="margin:8px 0;color:#374151;line-height:1.6;">${formatted}</p>`;
-    })
-    .join('');
-}
-
 export default async function handler(req, res) {
+  // Enable CORS
+  res.setHeader('Access-Control-Allow-Credentials', true);
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
+  res.setHeader(
+    'Access-Control-Allow-Headers',
+    'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version'
+  );
+
+  if (req.method === 'OPTIONS') {
+    res.status(200).end();
+    return;
+  }
+
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
-  const apiKey = process.env.GEMINI_API_KEY;
-  const resendApiKey = process.env.RESEND_API_KEY;
-  const senderEmail = process.env.RESEND_FROM_EMAIL || '@i Kazi <onboarding@resend.dev>';
-
-  if (!apiKey) {
-    return res.status(500).json({ error: 'Server missing GEMINI_API_KEY configuration.' });
-  }
-
-  const { currentRole, skills, targetRole, helpNeeded, biggestChallenge, timeframe, email } = req.body;
-
-  const systemPrompt = `You are an elite AI Career Architect for @i Kazi. Your goal is to construct a rigorous, highly actionable, structured 3-phase career roadmap based on the user's current baseline and career goals.
-Return the result strictly formatted in valid Markdown with clear headings (H2, H3), bullet points, and actionable checklists.
-
-Structure requirements:
-1. Executive Summary & Goal Strategy
-2. Phase 1: Foundation & Skill Gap Bridge (Focus on immediate high-impact capabilities)
-3. Phase 2: Proof & Portfolio Engineering (Focus on real-world projects, tangibles, proof of competence)
-4. Phase 3: Strategic Positioning & Execution (Focus on networking, job search, interview mastery, or promotion pitch)
-5. Key Recommended Projects & Tools Matrix
-6. Weekly Routine & Milestone Schedule (tailored to their specified timeframe)`;
-
-  const userQuery = `Construct a personalized career roadmap with these user details:
-- Current Role/Status: ${currentRole}
-- Existing Skills & Learnings: ${skills}
-- Target Career Role/Goal: ${targetRole}
-- Key Support Needed: ${Array.isArray(helpNeeded) ? helpNeeded.join(', ') : helpNeeded}
-- Biggest Challenge/Obstacle: ${biggestChallenge}
-- Target Timeframe: ${timeframe}
-- User Email: ${email}`;
-
   try {
-    // 1. Generate Roadmap via Gemini
-    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=${apiKey}`;
+    const { userQuery, systemPrompt } = req.body;
+    const apiKey = process.env.GEMINI_API_KEY;
 
-    const geminiRes = await fetch(apiUrl, {
+    if (!apiKey) {
+      return res.status(500).json({ error: 'GEMINI_API_KEY is not configured in Vercel settings.' });
+    }
+
+    // Using the stable Gemini model endpoint
+    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`;
+
+    // Combine system prompt and user query to enforce deep structured output
+    const fullPrompt = (systemPrompt ? systemPrompt + "\n\n" : "") + (userQuery || "");
+
+    const apiResponse = await fetch(apiUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        contents: [{ parts: [{ text: userQuery }] }],
-        systemInstruction: { parts: [{ text: systemPrompt }] }
+        contents: [
+          {
+            role: "user",
+            parts: [{ text: fullPrompt }]
+          }
+        ]
       })
     });
 
-    if (!geminiRes.ok) {
-      const errText = await geminiRes.text();
-      return res.status(geminiRes.status).json({ error: `Gemini API Error: ${errText}` });
+    const data = await apiResponse.json();
+
+    if (!apiResponse.ok) {
+      return res.status(apiResponse.status).json({ 
+        error: data.error?.message || 'Gemini API failed to generate response' 
+      });
     }
 
-    const result = await geminiRes.json();
-    const generatedText = result.candidates?.[0]?.content?.parts?.[0]?.text;
+    const generatedText = data.candidates?.[0]?.content?.parts?.[0]?.text;
 
     if (!generatedText) {
-      return res.status(500).json({ error: 'Received an empty response from Gemini AI.' });
+      return res.status(500).json({ error: 'Received empty response structure from Gemini API.' });
     }
 
-    // 2. Send Email via Resend (if RESEND_API_KEY is configured)
-    let emailSent = false;
-    if (resendApiKey && email) {
-      const htmlBody = `
-        <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;max-width:640px;margin:0 auto;padding:24px;background:#ffffff;color:#111827;">
-          <div style="border-bottom:2px solid #4f46e5;padding-bottom:16px;margin-bottom:24px;">
-            <span style="display:inline-block;background:#4f46e5;color:#ffffff;font-weight:700;padding:6px 12px;border-radius:8px;font-size:16px;">@i Kazi</span>
-            <p style="margin:8px 0 0;color:#6b7280;font-size:13px;">Your ${timeframe} Career Map to ${targetRole}</p>
-          </div>
-          ${markdownToEmailHtml(generatedText)}
-          <div style="margin-top:32px;padding-top:16px;border-top:1px solid #e5e7eb;font-size:12px;color:#9ca3af;text-align:center;">
-            Generated by @i Kazi • Map your career goal
-          </div>
-        </div>
-      `;
+    return res.status(200).json({ roadmap: generatedText });
 
-      const emailRes = await fetch('https://api.resend.com/emails', {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${resendApiKey}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          from: senderEmail,
-          to: [email],
-          subject: `Your @i Kazi Career Roadmap: ${targetRole} (${timeframe})`,
-          html: htmlBody
-        })
-      });
-
-      emailSent = emailRes.ok;
-      if (!emailRes.ok) {
-        console.error('Resend API error:', await emailRes.text());
-      }
-    }
-
-    return res.status(200).json({ roadmap: generatedText, emailSent });
   } catch (error) {
-    console.error('Serverless function error:', error);
-    return res.status(500).json({ error: 'Failed to process roadmap request.' });
+    console.error('Server error:', error);
+    return res.status(500).json({ error: error.message || 'Internal server error' });
   }
 }
